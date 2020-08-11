@@ -32,8 +32,8 @@ setup(
     ext_modules=[extension],
     provides=['ubus'],
     license="LGPL 2.1",
-    setup_requires=['pytest-runner'],
-    tests_require=['pytest'],
+    setup_requires=[],
+    tests_require=['pytest-runner', 'pytest'],
     zip_safe=False,
     classifiers=[
         'Programming Language :: Python :: 2.7',
