@@ -324,12 +324,12 @@ void dispose_connection(bool deregister)
 	if (ctx != NULL) {
 		if (deregister) {
 			// remove objects
-			for (int i = 0; i < objects_size; i++) {
+			for (size_t i = 0; i < objects_size; i++) {
 				ubus_remove_object(ctx, &objects[i]->object);
 			}
 
 			// remove listeners
-			for (int i = 0; i < listerners_size; i++) {
+			for (size_t i = 0; i < listerners_size; i++) {
 				ubus_unregister_event_handler(ctx, &listeners[i]->handler);
 			}
 		}
@@ -345,7 +345,7 @@ void dispose_connection(bool deregister)
 	}
 	// clear event listeners
 	if (listeners) {
-		for (int i = 0; i < listerners_size; i++) {
+		for (size_t i = 0; i < listerners_size; i++) {
 			free(listeners[i]);
 		}
 		free(listeners);
@@ -354,7 +354,7 @@ void dispose_connection(bool deregister)
 	}
 	// clear objects
 	if (objects) {
-		for (int i = 0; i < objects_size; i++) {
+		for (size_t i = 0; i < objects_size; i++) {
 			free_ubus_object(objects[i]);
 		}
 		free(objects);
@@ -467,6 +467,22 @@ static PyObject *ubus_python_get_connected(PyObject *module, PyObject *args, PyO
 }
 
 PyDoc_STRVAR(
+	unloop_doc,
+	"unloop()\n"
+	"\n"
+	"Exit ubus.loop().\n"
+	":rtype: None \n"
+);
+
+static PyObject *ubus_python_unloop(PyObject *module, PyObject *args, PyObject *kwargs)
+{
+	uloop_end();
+
+	Py_INCREF(Py_None);
+	return Py_None;
+}
+
+PyDoc_STRVAR(
 	get_socket_path_doc,
 	"get_socket_path()\n"
 	"\n"
@@ -559,7 +575,7 @@ static void ubus_python_event_handler(struct ubus_context *ctx, struct ubus_even
 	if (!data_object) {
 		goto event_handler_cleanup2;
 	}
-	
+
 	// Get PyObject callback
 	ubus_Listener *listener = container_of(ev, ubus_Listener, handler);
 
@@ -1341,6 +1357,7 @@ static PyMethodDef ubus_methods[] = {
 	{"send", (PyCFunction)ubus_python_send, METH_VARARGS|METH_KEYWORDS, connect_send_doc},
 	{"listen", (PyCFunction)ubus_python_listen, METH_VARARGS, connect_listen_doc},
 	{"loop", (PyCFunction)ubus_python_loop, METH_VARARGS|METH_KEYWORDS, connect_loop_doc},
+	{"unloop", (PyCFunction)ubus_python_unloop, METH_NOARGS, unloop_doc},
 	{"add", (PyCFunction)ubus_python_add, METH_VARARGS|METH_KEYWORDS, connect_add_doc},
 	{"objects", (PyCFunction)ubus_python_objects, METH_VARARGS|METH_KEYWORDS, connect_objects_doc},
 	{"call", (PyCFunction)ubus_python_call, METH_VARARGS|METH_KEYWORDS, connect_call_doc},
