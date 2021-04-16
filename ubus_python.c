@@ -21,7 +21,7 @@
 #include <stdio.h>
 
 #ifndef UBUS_UNIX_SOCKET
-#define UBUS_UNIX_SOCKET "/var/run/ubus.sock"
+#define UBUS_UNIX_SOCKET "/var/run/ubus/ubus.sock"
 #endif
 
 #define DEFAULT_SOCKET UBUS_UNIX_SOCKET
@@ -64,8 +64,7 @@ typedef struct {
 typedef struct {
 	struct ubus_event_handler handler;
 	PyObject *callback;
-}ubus_Listener ;
-
+} ubus_Listener ;
 
 PyObject *prepare_bool(bool yes)
 {
@@ -82,10 +81,13 @@ PyObject *prepare_bool(bool yes)
 static PyMethodDef ubus_methods[];
 PyObject *python_alloc_list = NULL;
 char *socket_path = NULL;
+
 ubus_Listener **listeners = NULL;
-size_t listerners_size = 0;
+size_t listeners_size = 0;
+
 ubus_Object **objects = NULL;
 size_t objects_size = 0;
+
 struct blob_buf python_buf;
 struct ubus_context *ctx = NULL;
 
@@ -123,6 +125,152 @@ PyObject *perform_json_function(enum json_function json_function, PyObject *inpu
 
 	return data_object;  // New reference - should be decreased by the caller
 }
+
+/* Timer */
+
+typedef struct {
+    PyObject_HEAD
+    PyObject * callback;
+    struct uloop_timeout u_timeout;
+} ubus_Timer;
+
+static void ubus_Timer_dealloc(ubus_Timer * const self)
+{
+    Py_XDECREF(self->callback);
+    uloop_timeout_cancel(&self->u_timeout);
+	Py_TYPE(self)->tp_free((PyObject*)self);
+}
+
+PyDoc_STRVAR(
+	Timer_start_doc,
+	"start(timeout)\n"
+	"\n"
+	"Start the timer for <timeout> milliseconds.\n"
+	"rtype: Bool (True if the timer was started, False if not)\n"
+);
+
+static PyObject *
+ubus_Timer_start(ubus_Timer * const self, PyObject * const args, PyObject * const kwargs)
+{
+    int timeout = 0;
+    static char * kwlist[] = {"timeout", NULL};
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "i", kwlist, &timeout))
+    {
+        return NULL;
+    }
+
+    if (timeout <= 0)
+    {
+        PyErr_Format(PyExc_TypeError, "invalid timeout");
+        return NULL;
+    }
+
+    int const ret = uloop_timeout_set(&self->u_timeout, timeout);
+
+    return prepare_bool(!ret);
+}
+
+PyDoc_STRVAR(
+	Timer_stop_doc,
+	"stop()\n"
+	"\n"
+	"Stop the timer if it was running.\n"
+	"rtype: Bool (True if timer was stopped, False if timer wasn't running)\n"
+);
+
+static PyObject *
+ubus_Timer_stop(ubus_Timer * const self, PyObject *Py_UNUSED(ignored))
+{
+    int const ret = uloop_timeout_cancel(&self->u_timeout);
+
+    return prepare_bool(!ret);
+}
+
+PyDoc_STRVAR(
+	Timer_doc,
+	"Timer\n"
+	"\n"
+	"Timer object.\n"
+);
+
+static PyMethodDef ubus_Timer_methods[] =
+{
+	{"start", (PyCFunction)ubus_Timer_start, METH_VARARGS|METH_KEYWORDS, Timer_start_doc},
+    {"stop", (PyCFunction)ubus_Timer_stop, METH_NOARGS, Timer_stop_doc},
+	{NULL},
+};
+
+static void ubus_timeout_handler(struct uloop_timeout *timeout) {
+    ubus_Timer * const self = container_of(timeout, ubus_Timer, u_timeout);
+    PyGILState_STATE gstate = PyGILState_Ensure();
+    PyObject *callback_arglist = Py_BuildValue("(O)", self);
+    if (!callback_arglist) {
+        goto timeout_handler_exit;
+    }
+    PyObject * const result = PyObject_CallObject(self->callback, callback_arglist);
+    Py_DECREF(callback_arglist);
+    if (result == NULL) {
+        PyErr_Print();
+    } else {
+        Py_DECREF(result);  // The result is ignored.
+    }
+
+timeout_handler_exit:
+    // Clear python exceptions
+    PyErr_Clear();
+
+    PyGILState_Release(gstate);
+}
+
+static int
+ubus_Timer_init(ubus_Timer * const self, PyObject * const args, PyObject * const kwargs)
+{
+    PyObject * callback = NULL;
+    static char *kwlist[] = {"callback",  NULL};
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O", kwlist, &callback))
+    {
+        return -1;
+    }
+
+    if (callback == NULL || !PyCallable_Check(callback))
+    {
+        PyErr_Format(PyExc_TypeError, "Callable expected");
+        return -1;
+    }
+
+    Py_INCREF(callback);
+    self->callback = callback;
+
+	return 0;
+}
+
+static PyObject *
+ubus_Timer_new(PyTypeObject * const type, PyObject * const args, PyObject * const kwargs)
+{
+	ubus_Timer * const self = (ubus_Timer *)type->tp_alloc(type, 1);
+
+    if (self != NULL)
+    {
+        memset(&self->u_timeout, 0, sizeof(self->u_timeout));
+        self->u_timeout.cb = ubus_timeout_handler;
+    }
+
+	return (PyObject *)self;
+}
+
+static PyTypeObject ubus_TimerType = {
+	PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "ubus.Timer",
+    .tp_doc = Timer_doc,
+    .tp_basicsize = sizeof(ubus_Timer),
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
+    .tp_new = 	ubus_Timer_new,					/* tp_new */
+    .tp_init = 	(initproc)ubus_Timer_init,		/* tp_init */
+    .tp_dealloc = 	(destructor)ubus_Timer_dealloc,	/* tp_dealloc */
+    .tp_methods = 	ubus_Timer_methods,				/* tp_methods */
+};
 
 /* ResponseHandler */
 
@@ -259,10 +407,6 @@ static PyTypeObject ubus_ResponseHandlerType = {
 typedef struct {
 	PyObject_HEAD
 	PyObject *socket_path;
-	ubus_Listener **listeners;
-	size_t listerners_size;
-	ubus_Object **objects;
-	size_t objects_size;
 	PyObject *alloc_list;  // Used for easy deallocation
 	struct blob_buf buf;
 	struct ubus_context *ctx;
@@ -329,7 +473,7 @@ void dispose_connection(bool deregister)
 			}
 
 			// remove listeners
-			for (size_t i = 0; i < listerners_size; i++) {
+			for (size_t i = 0; i < listeners_size; i++) {
 				ubus_unregister_event_handler(ctx, &listeners[i]->handler);
 			}
 		}
@@ -345,14 +489,15 @@ void dispose_connection(bool deregister)
 	}
 	// clear event listeners
 	if (listeners) {
-		for (size_t i = 0; i < listerners_size; i++) {
+		for (size_t i = 0; i < listeners_size; i++) {
 			free(listeners[i]);
 		}
 		free(listeners);
-		listerners_size = 0;
+		listeners_size = 0;
 		listeners = NULL;
 	}
-	// clear objects
+
+    // clear objects
 	if (objects) {
 		for (size_t i = 0; i < objects_size; i++) {
 			free_ubus_object(objects[i]);
@@ -430,7 +575,7 @@ static PyObject *ubus_python_connect(PyObject *module, PyObject *args, PyObject 
 
 	// Init event listner array
 	listeners = NULL;
-	listerners_size = 0;
+	listeners_size = 0;
 
 	// Init objects array
 	objects = NULL;
@@ -613,7 +758,7 @@ PyDoc_STRVAR(
 	"\n"
 	"Adds a listener on ubus events.\n"
 	"\n"
-	":param event: tuple contaning event string and a callback (str, callable) \n"
+	":param event: tuple containing event string and a callback (str, callable) \n"
 	":type event: tuple\n"
 );
 
@@ -695,18 +840,18 @@ static PyObject *ubus_python_listen(PyObject *module, PyObject *args, PyObject *
 		listener->callback = callback;
 
 		ubus_Listener **new_listeners = realloc(listeners,
-			(listerners_size + 1) * sizeof(*listeners));
+			(listeners_size + 1) * sizeof(*listeners));
 		if (!new_listeners) {
 			free(listener);
 			goto listen_error1;
 		}
 		listeners = new_listeners;
-		listeners[listerners_size++] = listener;
+		listeners[listeners_size++] = listener;
 
 		// register event handler
 		int retval = ubus_register_event_handler(ctx, &listener->handler, PyUnicode_AsUTF8(event));
 		if (retval != UBUS_STATUS_OK) {
-			listerners_size--;
+			listeners_size--;
 			free(listener);
 		}
 	}
@@ -1079,7 +1224,7 @@ static PyObject *ubus_python_add(PyObject *module, PyObject *args, PyObject *kwa
 
 		PyErr_Format(
 				PyExc_RuntimeError,
-				"ubus error occured: %s", ubus_strerror(ret)
+				"ubus error occurred: %s", ubus_strerror(ret)
 		);
 		return NULL;
 	}
@@ -1214,7 +1359,7 @@ static PyObject *ubus_python_objects(PyObject *module, PyObject *args, PyObject 
 			Py_DECREF(res);
 			PyErr_Format(
 					PyExc_RuntimeError,
-					"ubus error occured: %s", ubus_strerror(retval)
+					"ubus error occurred: %s", ubus_strerror(retval)
 			);
 			return NULL;
 	}
@@ -1228,7 +1373,7 @@ static void ubus_python_call_handler(struct ubus_request *req, int type, struct 
 
 	PyObject **results = (PyObject **)req->priv;
 	if (!*results) {
-		// error has occured in some previous call -> exit
+		// error has occurred in some previous call -> exit
 		return;
 	}
 
@@ -1340,7 +1485,7 @@ static PyObject *ubus_python_call(PyObject *module, PyObject *args, PyObject *kw
 		Py_XDECREF(results);
 		PyErr_Format(
 				PyExc_RuntimeError,
-				"ubus error occured: %s", ubus_strerror(retval)
+				"ubus error occurred: %s", ubus_strerror(retval)
 		);
 		return NULL;
 	}
@@ -1375,6 +1520,9 @@ void initubus(void)
 	if (PyType_Ready(&ubus_ResponseHandlerType)) {
 		goto init_ubus_exit_fail;
 	}
+    if (PyType_Ready(&ubus_TimerType)) {
+        goto init_ubus_exit_fail;
+    }
 
 	json_module = PyImport_ImportModule("json");
 	if (!json_module) {
@@ -1395,6 +1543,13 @@ void initubus(void)
 
 	Py_INCREF(&ubus_ResponseHandlerType);
 	PyModule_AddObject(module, "__ResponseHandler", (PyObject *)&ubus_ResponseHandlerType);
+    Py_INCREF(&ubus_TimerType);
+    if (PyModule_AddObject(module, "Timer", (PyObject *)&ubus_TimerType) < 0)
+    {
+        Py_DECREF(&ubus_TimerType);
+        Py_DECREF(module);
+        goto init_ubus_exit_fail;
+    }
 
 	/* export ubus json types */
 	PyModule_AddIntMacro(module, BLOBMSG_TYPE_UNSPEC);
