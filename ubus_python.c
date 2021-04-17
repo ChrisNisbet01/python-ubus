@@ -278,6 +278,8 @@ typedef struct {
 	PyObject_HEAD
 	struct ubus_context *ctx;
 	struct ubus_request_data *req;
+    bool is_deferred;
+    struct ubus_request_data deferred_req;
 	struct blob_buf buf;
 } ubus_ResponseHandler;
 
@@ -285,6 +287,22 @@ static void ubus_ResponseHandler_dealloc(ubus_ResponseHandler* self)
 {
 	blob_buf_free(&self->buf);
 	Py_TYPE(self)->tp_free((PyObject*)self);
+}
+
+PyDoc_STRVAR(
+	ResponseHandler_defer_doc,
+	"defer()\n"
+    "Defer the response to a later time\n"
+    "\n"
+);
+
+static PyObject *ubus_ResponseHandler_defer(ubus_ResponseHandler *self, PyObject *args, PyObject *kwargs)
+{
+    self->is_deferred = true;
+    ubus_defer_request(self->ctx, self->req, &self->deferred_req);
+
+    Py_INCREF(Py_None);
+    return Py_None;
 }
 
 PyDoc_STRVAR(
@@ -303,8 +321,9 @@ static PyObject *ubus_ResponseHandler_reply(ubus_ResponseHandler *self, PyObject
 	}
 
 	PyObject *data = NULL;
-	static char *kwlist[] = {"data",  NULL};
-	if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O", kwlist, &data)) {
+    int result = 0;
+	static char *kwlist[] = {"data", "result", NULL};
+	if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|i", kwlist, &data, &result)) {
 		return NULL;
 	}
 
@@ -324,13 +343,32 @@ static PyObject *ubus_ResponseHandler_reply(ubus_ResponseHandler *self, PyObject
 	}
 
 	// handler is not linked to a call response
-	if (!self->req || !self->ctx) {
-		PyErr_Format(PyExc_RuntimeError, "Handler is not linked to a call response.");
-		return NULL;
-	}
+    int retval;
 
-	int retval = ubus_send_reply(self->ctx, self->req, self->buf.head);
-	return prepare_bool(!retval);
+    if (!self->is_deferred)
+    {
+        if (self->req == NULL || !self->ctx)
+        {
+            PyErr_Format(PyExc_RuntimeError, "Handler is not linked to a call response.");
+            return NULL;
+        }
+
+        retval = ubus_send_reply(self->ctx, self->req, self->buf.head);
+    }
+    else
+    {
+        if (self->ctx == NULL)
+        {
+            PyErr_Format(PyExc_RuntimeError, "Handler is not linked to a call response.");
+            return NULL;
+        }
+        retval = ubus_send_reply(self->ctx, &self->deferred_req, self->buf.head);
+        ubus_complete_deferred_request(self->ctx, &self->deferred_req, result);
+        /* The handler should not be used once a deferred response has been sent. */
+        Py_DECREF(self);
+    }
+
+    return prepare_bool(!retval);
 }
 
 PyDoc_STRVAR(
@@ -342,6 +380,7 @@ PyDoc_STRVAR(
 
 static PyMethodDef ubus_ResponseHandler_methods[] = {
 	{"reply", (PyCFunction)ubus_ResponseHandler_reply, METH_VARARGS|METH_KEYWORDS, ResponseHandler_reply_doc},
+    {"defer", (PyCFunction)ubus_ResponseHandler_defer, METH_NOARGS, ResponseHandler_defer_doc},
 	{NULL},
 };
 
@@ -1027,9 +1066,12 @@ static int ubus_python_method_handler(struct ubus_context *ctx, struct ubus_obje
 method_handler_cleanup3:
 	// NULLify the structures so that using this structure will we useless if a reference
 	// is left outside the callback code
-	((ubus_ResponseHandler *)handler)->req = NULL;
-	((ubus_ResponseHandler *)handler)->ctx = NULL;
-	Py_DECREF(handler);
+    if (!((ubus_ResponseHandler *)handler)->is_deferred)
+    {
+        ((ubus_ResponseHandler *)handler)->req = NULL;
+        ((ubus_ResponseHandler *)handler)->ctx = NULL;
+        Py_DECREF(handler);
+    }
 method_handler_cleanup2:
 	Py_DECREF(data_object);
 method_handler_cleanup1:
