@@ -126,6 +126,183 @@ PyObject *perform_json_function(enum json_function json_function, PyObject *inpu
 	return data_object;  // New reference - should be decreased by the caller
 }
 
+/* FD reader */
+typedef struct
+{
+    PyObject_HEAD
+    PyObject * fd;
+    PyObject * callback;
+    struct uloop_fd ufd;
+} fd_listener_st;
+
+static void fd_listener_dealloc(fd_listener_st * const self)
+{
+    Py_XDECREF(self->callback);
+    Py_XDECREF(self->fd);
+    uloop_fd_delete(&self->ufd);
+    self->ufd.fd = -1;
+	Py_TYPE(self)->tp_free((PyObject*)self);
+}
+
+static void
+fd_handler(struct uloop_fd * ufd, unsigned int events)
+{
+    fd_listener_st * const self = container_of(ufd, fd_listener_st, ufd);
+    PyGILState_STATE gstate = PyGILState_Ensure();
+
+    if (self->callback == NULL)
+    {
+        /* Shouldn't happen. */
+        goto done;
+    }
+    PyObject * const eof = prepare_bool(ufd->eof);
+    PyObject * const error = prepare_bool(ufd->error);
+    Py_INCREF(self->fd);
+    Py_INCREF((PyObject *)self);
+
+    PyObject * callback_arglist = Py_BuildValue("(O, O, O, O)", self, self->fd, eof, error);
+    if (!callback_arglist)
+    {
+        goto done;
+    }
+
+    PyObject * const result = PyObject_CallObject(self->callback, callback_arglist);
+
+    Py_DECREF(callback_arglist);
+    Py_DECREF(eof);
+    Py_DECREF(error);
+    Py_DECREF(self->fd);
+    Py_DECREF((PyObject *)self);
+
+    if (result == NULL) {
+        PyErr_Print();
+    } else {
+        Py_DECREF(result);  // The result is ignored.
+    }
+
+done:
+    // Clear python exceptions
+    PyErr_Clear();
+
+    PyGILState_Release(gstate);
+}
+
+PyDoc_STRVAR(
+	fd_add_doc,
+	"add()\n"
+	"\n"
+	"Request a callback when the file handle is readable.\n"
+	"rtype: None\n"
+);
+
+static PyObject *
+fd_add(fd_listener_st * const self, PyObject *Py_UNUSED(ignored))
+{
+    uloop_fd_add(&self->ufd, ULOOP_READ);
+
+    Py_INCREF(Py_None);
+    return Py_None;
+}
+
+PyDoc_STRVAR(
+	fd_remove_doc,
+	"remove()\n"
+	"\n"
+	"No callback called when the file is readable.\n"
+    "rtype: None\n"
+);
+
+static PyObject *
+fd_remove(fd_listener_st * const self, PyObject *Py_UNUSED(ignored))
+{
+    uloop_fd_delete(&self->ufd);
+
+    Py_INCREF(Py_None);
+    return Py_None;
+}
+
+PyDoc_STRVAR(
+	fd_listener_doc,
+	"FDListener\n"
+	"\n"
+	"FD listener object.\n"
+);
+
+static PyMethodDef fd_listener_methods[] =
+{
+	{"add", (PyCFunction)fd_add, METH_NOARGS, fd_add_doc},
+    {"remove", (PyCFunction)fd_remove, METH_NOARGS, fd_remove_doc},
+	{NULL},
+};
+
+static int
+fd_listener_init(fd_listener_st * const self, PyObject * const args, PyObject * const kwargs)
+{
+    PyObject * fd_obj = NULL;
+    PyObject * callback = NULL;
+    static char *kwlist[] = {"fd", "callback", NULL};
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO", kwlist, &fd_obj, &callback))
+    {
+        return -1;
+    }
+
+    if (fd_obj == NULL)
+    {
+        PyErr_Format(PyExc_TypeError, "file handle expected");
+        return -1;
+    }
+
+    int const fd = PyObject_AsFileDescriptor(fd_obj);
+    if (fd < 0)
+    {
+        PyErr_Format(PyExc_TypeError, "open file handle expected");
+        return -1;
+    }
+
+    if (callback == NULL || !PyCallable_Check(callback))
+    {
+        PyErr_Format(PyExc_TypeError, "Callable expected");
+        return -1;
+    }
+
+    Py_INCREF(callback);
+    Py_INCREF(fd_obj);
+    self->callback = callback;
+    self->fd = fd_obj;
+    self->ufd.fd = fd;
+
+    /* All ready to go. User should call add/remove as desired. */
+
+	return 0;
+}
+
+static PyObject *
+fd_listener_new(PyTypeObject * const type, PyObject * const args, PyObject * const kwargs)
+{
+	fd_listener_st * const self = (fd_listener_st *)type->tp_alloc(type, 1);
+
+    if (self != NULL)
+    {
+        memset(&self->ufd, 0, sizeof self->ufd);
+        self->ufd.cb = fd_handler;
+    }
+
+	return (PyObject *)self;
+}
+
+static PyTypeObject fd_listener_type = {
+	PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "ubus.FDListener",
+    .tp_doc = fd_listener_doc,
+    .tp_basicsize = sizeof(fd_listener_st),
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
+    .tp_new = 	fd_listener_new,
+    .tp_init = 	(initproc)fd_listener_init,
+    .tp_dealloc = 	(destructor)fd_listener_dealloc,
+    .tp_methods = 	fd_listener_methods,
+};
+
 /* Timer */
 
 typedef struct {
@@ -1565,6 +1742,10 @@ void initubus(void)
     if (PyType_Ready(&ubus_TimerType)) {
         goto init_ubus_exit_fail;
     }
+    if (PyType_Ready(&fd_listener_type))
+    {
+        goto init_ubus_exit_fail;
+    }
 
 	json_module = PyImport_ImportModule("json");
 	if (!json_module) {
@@ -1589,6 +1770,13 @@ void initubus(void)
     if (PyModule_AddObject(module, "Timer", (PyObject *)&ubus_TimerType) < 0)
     {
         Py_DECREF(&ubus_TimerType);
+        Py_DECREF(module);
+        goto init_ubus_exit_fail;
+    }
+    Py_INCREF(&fd_listener_type);
+    if (PyModule_AddObject(module, "FDListener", (PyObject *)&fd_listener_type) < 0)
+    {
+        Py_DECREF(&fd_listener_type);
         Py_DECREF(module);
         goto init_ubus_exit_fail;
     }
